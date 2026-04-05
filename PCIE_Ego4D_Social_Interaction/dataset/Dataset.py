@@ -280,10 +280,10 @@ if (__name__ == "__main__"):
     class config:
         def __init__(self):
             self.dataPaths = {
-                "ttmPath": "../../../data/ttm",
-                "audioPath": "../../../data/wave",
-                "trainSplitPath": "../../../data/split/train.txt",
-                "validSplitPath": "../../../data/split/valid.txt",
+                "ttmPath"    :"/DATA/G17/Group17_Who_is_Talking_To_Me/starter_code/data/result_TTM/",
+                "audioPath"    : "/DATA/G17/Data/wave/",
+                "trainSplitPath" : "/DATA/G17/Group17_Who_is_Talking_To_Me/starter_code/data/split/train.list",
+                "validSplitPath" : "/DATA/G17/Group17_Who_is_Talking_To_Me/starter_code/data/split/val.list"
             }
             self.minLength = 0.1
             self.batchSizeForward = 4
