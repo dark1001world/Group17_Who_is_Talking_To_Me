@@ -1,0 +1,549 @@
+"""
+Visual Pipeline - Data Loader (Final Corrected Version)
+=========================================================
+Fixes applied:
+  1. Temporally consistent transforms — same crop/flip/jitter for all frames
+  2. Light augmentations suitable for face crops
+  3. Skip zero-length and short segments (< 8 frames)
+    4. Correct label extraction — tag/tags value 1 = positive
+  5. img_00001.jpg frame naming format
+  6. Dense clip sampling for Video Swin
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import random
+import glob
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+from PIL import Image
+from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2 as T
+
+
+# ──────────────────────────────────────────────────────────────
+#  Config
+# ──────────────────────────────────────────────────────────────
+
+@dataclass
+class ViTVisualConfig:
+    source_path  : str   = "data/video_imgs"
+    json_path    : str   = "data/json_original"
+    gt_path      : str   = "data/result_TTM"
+    train_file   : str   = "data/split/train.list"
+    val_file     : str   = "data/split/val.list"
+    test_path    : str   = ""
+    clip_frames  : int   = 16
+    img_size     : int   = 128
+    train_stride : int   = 4
+    val_stride   : int   = 4
+    test_stride  : int   = 1
+    batch_size   : int   = 6
+    num_workers  : int   = 10
+    pin_memory   : bool  = True
+    min_seg_frames: int  = 8      # skip segments shorter than this
+
+
+# ──────────────────────────────────────────────────────────────
+#  Normalization constants
+# ──────────────────────────────────────────────────────────────
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+# ──────────────────────────────────────────────────────────────
+#  Val / Test transform  (deterministic)
+# ──────────────────────────────────────────────────────────────
+
+def get_val_transform(img_size: int = 128) -> T.Compose:
+    return T.Compose([
+        T.ToImage(),
+        T.ToDtype(torch.float32, scale=True),
+        T.Resize(int(img_size * 256 / 224), antialias=True),
+        T.CenterCrop(img_size),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+
+# ──────────────────────────────────────────────────────────────
+#  Temporally consistent train augmentation
+#  Same spatial transform applied to EVERY frame in a clip
+# ──────────────────────────────────────────────────────────────
+
+class ConsistentClipTransform:
+    """
+    Generates augmentation parameters ONCE per clip,
+    applies identical spatial transform to every frame.
+    Uses only PIL + stable torchvision.transforms.functional API.
+    """
+
+    def __init__(self, img_size: int = 128):
+        self.img_size  = img_size
+        self.normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+    def __call__(self, frames: list[Image.Image]) -> list[Tensor]:
+        # sample shared params ONCE for entire clip
+        i, j, h, w = T.RandomResizedCrop.get_params(
+            frames[0],
+            scale=(0.85, 1.0),
+            ratio=(0.9, 1.1),
+        )
+        do_flip    = random.random() < 0.5
+        brightness = random.uniform(0.8, 1.2)
+        contrast   = random.uniform(0.8, 1.2)
+        saturation = random.uniform(0.9, 1.1)
+
+        processed = []
+        for frame in frames:
+            # 1. same spatial crop — PIL → PIL
+            frame = TF.resized_crop(
+                frame, i, j, h, w,
+                [self.img_size, self.img_size],
+            )
+            # 2. same flip — PIL → PIL
+            if do_flip:
+                frame = TF.hflip(frame)
+
+            # 3. PIL → Tensor [C, H, W] float32 in [0, 1]
+            frame = TF.to_tensor(frame)
+
+            # 4. same color jitter — Tensor → Tensor
+            frame = TF.adjust_brightness(frame, brightness)
+            frame = TF.adjust_contrast(frame, contrast)
+            frame = TF.adjust_saturation(frame, saturation)
+
+            # 5. normalize
+            frame = self.normalize(frame)
+
+            processed.append(frame)
+
+        return processed
+
+# ──────────────────────────────────────────────────────────────
+#  Helpers
+# ──────────────────────────────────────────────────────────────
+
+def _load_uid_list(path: str) -> list[str]:
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip()]
+
+
+def _load_json(path: str):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _load_frame(p: str) -> Image.Image:
+    return Image.open(p).convert("RGB")
+
+
+def _load_face_bboxes(uid: str, json_root: str) -> dict[str, tuple[int, int, int, int]]:
+    """Load per-frame face boxes keyed by '<frame>:<personid>' for one UID."""
+    uid_dir = os.path.join(json_root, uid)
+    if not os.path.isdir(uid_dir):
+        return {}
+
+    out: dict[str, tuple[int, int, int, int]] = {}
+    for track_file in glob.glob(os.path.join(uid_dir, "*.json")):
+        try:
+            track = _load_json(track_file)
+        except Exception:
+            continue
+        if not isinstance(track, list):
+            continue
+
+        for frame in track:
+            try:
+                pid_raw = frame.get("Person ID", "")
+                pid = str(pid_raw).replace("'", "")
+                if not pid:
+                    continue
+
+                fid = int(frame["frameNumber"])
+                x = float(frame["x"])
+                y = float(frame["y"])
+                w = float(frame["width"])
+                h = float(frame["height"])
+                if w <= 0 or h <= 0 or fid <= 0:
+                    continue
+
+                x1 = max(0, int(x))
+                y1 = max(0, int(y))
+                x2 = max(x1 + 1, int(x + w))
+                y2 = max(y1 + 1, int(y + h))
+                out[f"{fid}:{pid}"] = (x1, y1, x2, y2)
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    return out
+
+
+def _crop_face_or_black(img: Image.Image, bbox: tuple[int, int, int, int] | None) -> Image.Image:
+    """Crop face with bbox; if missing/invalid, return a black frame of same size."""
+    if bbox is None:
+        return Image.new("RGB", img.size, (0, 0, 0))
+
+    x1, y1, x2, y2 = bbox
+    w, h = img.size
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(x1 + 1, min(x2, w))
+    y2 = max(y1 + 1, min(y2, h))
+    if x2 <= x1 or y2 <= y1:
+        return Image.new("RGB", img.size, (0, 0, 0))
+    return img.crop((x1, y1, x2, y2))
+
+
+def _resolve_frame_path(frame_dir: str, fid: int) -> str | None:
+    """Try all known naming formats."""
+    for fmt in (
+        f"img_{fid:05d}.jpg",
+        f"img_{fid:06d}.jpg",
+        f"{fid:06d}.jpg",
+        f"{fid:05d}.jpg",
+        f"{fid}.jpg",
+        f"img_{fid:05d}.png",
+        f"{fid:06d}.png",
+    ):
+        p = os.path.join(frame_dir, fmt)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+# ──────────────────────────────────────────────────────────────
+#  Sample builder
+# ──────────────────────────────────────────────────────────────
+
+def _build_samples(
+    uid           : str,
+    gt_path       : str,
+    source_path   : str,
+    json_path     : str,
+    stride        : int,
+    min_seg_frames: int = 8,
+) -> list[dict]:
+    gt_file   = os.path.join(gt_path,    f"{uid}.json")
+    frame_dir = os.path.join(source_path, uid)
+
+    if not os.path.isfile(gt_file) or not os.path.isdir(frame_dir):
+        return []
+
+    segments = _load_json(gt_file)
+    if not isinstance(segments, list) or not segments:
+        return []
+
+    # get all available frame numbers from disk
+    all_frames = sorted([
+        int(f.replace("img_", "").replace(".jpg", "").replace(".png", ""))
+        for f in os.listdir(frame_dir)
+        if (f.startswith("img_") or f[0].isdigit()) and
+           (f.endswith(".jpg") or f.endswith(".png"))
+    ])
+    if not all_frames:
+        return []
+
+    face_bboxes = _load_face_bboxes(uid, json_path)
+
+    frame_set = set(all_frames)
+    samples   = []
+
+    for seg in segments:
+        # Person ID from annotation (kept for filtering/traceability).
+        try:
+            personid = int(seg.get("label", 0))
+        except (TypeError, ValueError):
+            personid = 0
+
+        start = int(seg["start_frame"])
+        end   = int(seg["end_frame"])
+
+        # skip zero-length or too-short segments
+        if end - start < min_seg_frames:
+            continue
+
+        # Binary target: talking-to-me is positive only when tag/tags == 1.
+        tag_value = seg.get("tags", seg.get("tag", None))
+        try:
+            tag_value = int(tag_value) if tag_value is not None else 0
+        except (TypeError, ValueError):
+            tag_value = 0
+        label = 1 if tag_value == 1 else 0
+
+        # Match starter pipeline behavior: ignore unknown/invalid person id.
+        if personid == 0:
+            continue
+
+        # get frames in segment that exist on disk
+        seg_frames = [
+            f for f in range(start, end + 1, stride)
+            if f in frame_set
+        ]
+
+        # fallback: nearest frames in range
+        if not seg_frames:
+            seg_frames = [
+                f for f in all_frames
+                if start <= f <= end
+            ][::stride]
+
+        if not seg_frames:
+            continue
+
+        frame_items = []
+        for f in seg_frames:
+            p = _resolve_frame_path(frame_dir, f)
+            if not p:
+                continue
+            key = f"{f}:{personid}"
+            frame_items.append({"path": p, "bbox": face_bboxes.get(key)})
+
+        if len(frame_items) >= 2:
+            samples.append({
+                "uid"     : uid,
+                "personid": personid,
+                "frames"  : frame_items,
+                "label"   : label,
+            })
+
+    return samples
+
+
+# ──────────────────────────────────────────────────────────────
+#  Clip sampler
+# ──────────────────────────────────────────────────────────────
+
+def _sample_clip(
+    paths       : list,
+    clip_frames : int,
+    training    : bool,
+) -> list:
+    n = len(paths)
+    if n == 0:
+        raise ValueError("Empty frame list")
+
+    if n < clip_frames:
+        # repeat-pad
+        return (paths * ((clip_frames // n) + 1))[:clip_frames]
+
+    if training:
+        # random temporal crop
+        start = random.randint(0, n - clip_frames)
+        return paths[start : start + clip_frames]
+    else:
+        # uniform sampling
+        idxs = np.linspace(0, n - 1, clip_frames, dtype=int)
+        return [paths[i] for i in idxs]
+
+
+# ──────────────────────────────────────────────────────────────
+#  Train / Val Dataset
+# ──────────────────────────────────────────────────────────────
+
+class ViTImagerLoader(Dataset):
+    """
+    Returns clips [C, T, H, W] with temporally consistent augmentation.
+    """
+
+    def __init__(
+        self,
+        source_path   : str,
+        split_file    : str,
+        json_path     : str,
+        gt_path       : str,
+        stride        : int  = 4,
+        clip_frames   : int  = 16,
+        img_size      : int  = 128,
+        min_seg_frames: int  = 8,
+        mode          : Literal["train", "val"] = "train",
+    ):
+        self.clip_frames = clip_frames
+        self.training    = (mode == "train")
+        self.img_size    = img_size
+
+        # transforms
+        self.train_transform = ConsistentClipTransform(img_size)
+        self.val_transform   = get_val_transform(img_size)
+
+        uids = _load_uid_list(split_file)
+        print(f"[ViTLoader] Building '{mode}' from {len(uids)} UIDs …")
+
+        self.samples: list[dict] = []
+        for uid in uids:
+            self.samples.extend(
+                _build_samples(uid, gt_path, source_path, json_path, stride, min_seg_frames)
+            )
+
+        pos = sum(s["label"] == 1 for s in self.samples)
+        neg = len(self.samples) - pos
+        print(f"[ViTLoader] '{mode}': {len(self.samples)} samples  "
+              f"pos={pos}  neg={neg}  ratio=1:{neg/max(pos,1):.1f}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[Tensor, int]:
+        s           = self.samples[idx]
+        frame_items = _sample_clip(s["frames"], self.clip_frames, self.training)
+        frames      = []
+        for item in frame_items:
+            img = _load_frame(item["path"])
+            frames.append(_crop_face_or_black(img, item.get("bbox")))
+
+        if self.training:
+            # temporally consistent augmentation
+            processed = self.train_transform(frames)
+        else:
+            # deterministic val transform
+            processed = [self.val_transform(f) for f in frames]
+
+        clip = torch.stack(processed, dim=1)   # [C, T, H, W]
+        return clip, s["label"]
+
+
+# ──────────────────────────────────────────────────────────────
+#  Test Dataset
+# ──────────────────────────────────────────────────────────────
+
+class ViTTestImagerLoader(Dataset):
+    def __init__(
+        self,
+        test_path   : str,
+        stride      : int = 1,
+        clip_frames : int = 16,
+        img_size    : int = 128,
+    ):
+        self.clip_frames   = clip_frames
+        self.val_transform = get_val_transform(img_size)
+        self.samples       = self._build(test_path, stride)
+        print(f"[ViTTestLoader] {len(self.samples)} test samples")
+
+    def _build(self, test_path: str, stride: int) -> list[dict]:
+        samples = []
+        for uid in sorted(os.listdir(test_path)):
+            face_dir = os.path.join(test_path, uid, "face")
+            if not os.path.isdir(face_dir):
+                face_dir = os.path.join(test_path, uid)
+            if not os.path.isdir(face_dir):
+                continue
+
+            fids = sorted([
+                int(Path(f).stem.replace("img_", ""))
+                for f in os.listdir(face_dir)
+                if f.endswith((".jpg", ".png"))
+            ])
+            fids  = fids[::stride]
+            paths = [_resolve_frame_path(face_dir, f) for f in fids]
+            paths = [p for p in paths if p]
+            if paths:
+                samples.append({"uid": uid, "frames": paths, "fids": fids})
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[Tensor, dict]:
+        s  = self.samples[idx]
+        fp = _sample_clip(s["frames"], self.clip_frames, training=False)
+        clip = torch.stack(
+            [self.val_transform(_load_frame(p)) for p in fp], dim=1
+        )
+        return clip, {"uid": s["uid"], "fid2pred": s["fids"]}
+
+
+# ──────────────────────────────────────────────────────────────
+#  Infer Dataset
+# ──────────────────────────────────────────────────────────────
+
+class ViTInferImagerLoader(ViTTestImagerLoader):
+    pass
+
+
+# ──────────────────────────────────────────────────────────────
+#  MixUp  (batch-level, optional)
+# ──────────────────────────────────────────────────────────────
+
+def mixup_batch(
+    clips      : Tensor,
+    labels     : Tensor,
+    alpha      : float = 0.2,
+    num_classes: int   = 2,
+) -> tuple[Tensor, Tensor]:
+    lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
+    B   = clips.size(0)
+    idx = torch.randperm(B, device=clips.device)
+
+    mixed  = lam * clips + (1 - lam) * clips[idx]
+    onehot = torch.zeros(B, num_classes, device=clips.device)
+    onehot.scatter_(1, labels.unsqueeze(1), 1)
+    soft = lam * onehot + (1 - lam) * onehot[idx]
+    return mixed, soft
+
+
+# ──────────────────────────────────────────────────────────────
+#  Factory
+# ──────────────────────────────────────────────────────────────
+
+def get_loader(
+    cfg        : ViTVisualConfig,
+    mode       : Literal["train", "val", "test", "infer"],
+    distributed: bool = False,
+) -> DataLoader:
+
+    sampler = None
+
+    if mode in ("train", "val"):
+        dataset = ViTImagerLoader(
+            source_path    = cfg.source_path,
+            split_file     = cfg.train_file if mode == "train" else cfg.val_file,
+            gt_path        = cfg.gt_path,
+            json_path      = cfg.json_path,
+            stride         = cfg.train_stride if mode == "train" else cfg.val_stride,
+            clip_frames    = cfg.clip_frames,
+            img_size       = cfg.img_size,
+            min_seg_frames = cfg.min_seg_frames,
+            mode           = mode,
+        )
+        if distributed and mode == "train":
+            from torch.utils.data import DistributedSampler
+            sampler = DistributedSampler(dataset, shuffle=True)
+
+    elif mode == "test":
+        dataset = ViTTestImagerLoader(
+            test_path   = cfg.test_path,
+            stride      = cfg.test_stride,
+            clip_frames = cfg.clip_frames,
+            img_size    = cfg.img_size,
+        )
+    elif mode == "infer":
+        dataset = ViTInferImagerLoader(
+            test_path   = cfg.test_path,
+            stride      = cfg.test_stride,
+            clip_frames = cfg.clip_frames,
+            img_size    = cfg.img_size,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    shuffle = (mode == "train") and (sampler is None)
+
+    return DataLoader(
+        dataset,
+        batch_size         = cfg.batch_size,
+        shuffle            = shuffle,
+        sampler            = sampler,
+        num_workers        = cfg.num_workers,
+        pin_memory         = cfg.pin_memory,
+        persistent_workers = (cfg.num_workers > 0),
+        prefetch_factor    = 2 if cfg.num_workers > 0 else None,
+        drop_last          = (mode == "train"),
+    )
