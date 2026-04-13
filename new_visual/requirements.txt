@@ -1,0 +1,23 @@
+# ViT Visual Pipeline - Requirements
+# Python 3.10  |  CUDA 13.x  |  torch 2.11 (nightly)
+
+# Already installed — DO NOT reinstall these:
+# torch==2.11.0
+# torchvision==0.26.0
+# torchaudio==2.11.0
+
+# ViT models
+timm>=1.0.0
+
+# Data
+Pillow>=10.0.0
+numpy>=1.26.0
+
+# Metrics
+scikit-learn>=1.4.0
+
+# Progress
+tqdm>=4.66.0
+
+# Fix ultralytics conflict
+opencv-python>=4.6.0
