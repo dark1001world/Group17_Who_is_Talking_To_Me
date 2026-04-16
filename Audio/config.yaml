@@ -1,0 +1,152 @@
+# # ─────────────────────────────────────────────
+# #  TTM Audio Pipeline – Config
+# #  GPU: NVIDIA A5000 (24 GB VRAM)
+# #  Model: openai/whisper-large-v3  (encoder only)
+# # ─────────────────────────────────────────────
+
+# project:
+#   name: "ttm_audio_whisper"
+#   seed: 42
+#   output_dir: "/DATA/G17/outputs/ttm_audio"
+#   log_dir: "/DATA/G17/outputs/ttm_audio/logs"
+#   embed_dir: "/DATA/G17/outputs/ttm_audio/embeddings"   # timestamped .pt files saved here
+
+# # ── Paths ──────────────────────────────────────
+# data:
+#   root: "/DATA/G17/Data/wave"
+#   annotations_dir: "/DATA/G17/ego4d_data/v2/annotations"
+#   train_json: "av_train.json"
+#   val_json:   "av_val.json"
+#   audio_ext: ".wav"          # extension of extracted clips (change to .mp3 if needed)
+#   sample_rate: 16000         # Whisper expects 16 kHz
+#   max_audio_sec: 30          # Whisper processes 30 s chunks; clips longer than this are windowed
+#   clip_overlap_sec: 2        # overlap between consecutive windows for long clips
+
+# # ── Model ──────────────────────────────────────
+# model:
+#   backbone: "openai/whisper-large-v3"
+#   freeze_encoder_layers: 20          # freeze first 20 of 32 encoder layers (saves VRAM)
+#   projection_dim: 512                # project 1280-d encoder hidden states → 512-d embeddings
+#   dropout: 0.1
+#   num_classes: 2                     # TTM binary: talking-to-me / not
+
+# # ── Training ───────────────────────────────────
+# training:
+#   epochs: 10
+#   batch_size: 4                      # safe for A5000 with fp16 + gradient checkpointing
+#   accumulation_steps: 8              # effective batch = 32
+#   learning_rate: 1.0e-4
+#   weight_decay: 0.01
+#   warmup_ratio: 0.1
+#   max_grad_norm: 1.0
+#   precision: "bf16"                  # A5000 supports bf16; change to "fp16" if issues arise
+#   gradient_checkpointing: true
+#   dataloader_workers: 4
+#   pin_memory: true
+
+#   # Scheduler
+#   scheduler: "cosine_with_restarts"
+#   num_cycles: 2
+
+#   # Class imbalance (TTM is typically imbalanced)
+#   use_focal_loss: true
+#   focal_gamma: 2.0
+#   focal_alpha: 0.25
+
+#   # Checkpointing
+#   save_every_n_epochs: 1
+#   keep_last_n_checkpoints: 3
+#   early_stopping_patience: 4
+#   monitor_metric: "val_auc"
+
+# # ── Embedding Extraction ───────────────────────
+# extraction:
+#   batch_size: 16                     # larger batch OK since no gradients
+#   layer: "all"                       # "all" → concat last 4 layers; or int e.g. 32 for last layer only
+#   pool_strategy: "none"              # "none"=keep temporal dim | "mean" | "cls"
+#   output_format: "pt"                # save as torch .pt files; change to "npy" if preferred
+#   save_per_clip: true                # one file per clip_uid
+#   fp16_inference: true
+
+# ─────────────────────────────────────────────────────────────────
+#  TTM Audio Pipeline – Improved Config v2
+#  GPU: NVIDIA RTX A5000 (24 GB VRAM)
+#  Model: openai/whisper-large-v3 encoder
+#
+#  Changes from v1 (and why):
+#  - freeze_encoder_layers 20→30  : only top 2 layers train, less overfitting
+#  - learning_rate 1e-4→3e-5      : slower updates, more stable
+#  - weight_decay 0.01→0.05       : stronger L2 regularisation
+#  - dropout 0.1→0.2              : more dropout in projection+head
+#  - accumulation_steps 8→16      : effective batch 64, smoother gradients
+#  - warmup_ratio 0.1→0.15        : longer warmup for small LR
+#  - early_stopping_patience 4→3  : stop sooner to avoid overfitting
+#  - use_focal_loss true          : handles class imbalance better than CE
+#  - num_cycles 2→1               : single cosine decay, more stable
+#  - epochs 10→15                 : more epochs since LR is lower
+# ─────────────────────────────────────────────────────────────────
+
+project:
+  name: "ttm_audio_v2"
+  seed: 42
+  output_dir: "/DATA/G17/outputs/ttm_audio_v2"
+  log_dir: "/DATA/G17/outputs/ttm_audio_v2/logs"
+  embed_dir: "/DATA/G17/outputs/ttm_audio_v2/embeddings"
+
+# ── Paths ─────────────────────────────────────────────────────────
+data:
+  root: "/DATA/G17/Data/wave"
+  annotations_dir: "/DATA/G17/ego4d_data/v2/annotations"
+  train_json: "av_train.json"
+  val_json:   "av_val.json"
+  audio_ext: ".wav"
+  sample_rate: 16000
+  max_audio_sec: 30
+  clip_overlap_sec: 2
+
+# ── Model ─────────────────────────────────────────────────────────
+model:
+  backbone: "openai/whisper-large-v3"
+  freeze_encoder_layers: 30    # only top 2 of 32 layers train
+                               # v1 used 20 → caused massive overfitting
+  projection_dim: 512
+  dropout: 0.2                 # increased from 0.1
+  num_classes: 2
+
+# ── Training ──────────────────────────────────────────────────────
+training:
+  epochs: 15
+  batch_size: 4
+  accumulation_steps: 16       # effective batch = 64 (was 32)
+  learning_rate: 3.0e-5        # reduced from 1e-4
+  weight_decay: 0.05           # increased from 0.01
+  warmup_ratio: 0.15           # slightly longer warmup
+  max_grad_norm: 1.0
+  precision: "fp32"            # stable – bf16 caused NaN issues
+  gradient_checkpointing: false
+  dataloader_workers: 4
+  pin_memory: true
+
+  # Scheduler – single cosine decay
+  scheduler: "cosine_with_restarts"
+  num_cycles: 1
+
+  # Focal loss for class imbalance
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+
+  # Checkpointing
+  save_every_n_epochs: 1
+  keep_last_n_checkpoints: 3
+  early_stopping_patience: 3   # stop sooner than v1
+  monitor_metric: "val_auc"
+
+# ── Embedding Extraction ──────────────────────────────────────────
+extraction:
+  batch_size: 8
+  layer: "all"
+  pool_strategy: "none"
+  output_format: "pt"
+  save_per_clip: true
+  fp16_inference: false        # keep false – model is fp32

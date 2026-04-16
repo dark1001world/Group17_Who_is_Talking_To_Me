@@ -1,0 +1,9 @@
+13:21:08 INFO – Device: cuda
+Traceback (most recent call last):
+  File "/DATA/G17/Group17_Who_is_Talking_To_Me/Audio/utils.py", line 347, in <module>
+    main()
+  File "/DATA/G17/Group17_Who_is_Talking_To_Me/Audio/utils.py", line 343, in main
+    run_extraction(cfg, args.checkpoint, args.split, args.clip_uid, device)
+  File "/DATA/G17/Group17_Who_is_Talking_To_Me/Audio/utils.py", line 233, in run_extraction
+    ann_dir   = Path(cfg["data"]["annotations_dir"])
+KeyError: 'data'

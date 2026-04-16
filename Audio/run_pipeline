@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  run_pipeline.sh
+#  Full TTM audio pipeline: install → inspect → train → extract embeddings
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── 0. Config ────────────────────────────────────────────────────────────────
+WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="$WORK_DIR/config.yaml"
+CHECKPOINT=""      # set to path if resuming, e.g. CHECKPOINT="outputs/.../ckpt_best.pt"
+SKIP_TRAIN=0       # set to 1 to skip training and only extract embeddings
+DEVICE="cuda"
+
+echo "=================================================================="
+echo "  TTM Audio Pipeline"
+echo "  Work dir  : $WORK_DIR"
+echo "  Config    : $CONFIG"
+echo "  Device    : $DEVICE"
+echo "=================================================================="
+
+# ── 1. Install dependencies ──────────────────────────────────────────────────
+echo ""
+echo ">>> [1/5] Installing Python dependencies …"
+pip install -r "$WORK_DIR/requirements.txt" --quiet
+
+# ── 2. Inspect annotation schema ─────────────────────────────────────────────
+echo ""
+echo ">>> [2/5] Inspecting annotation JSON schema …"
+python "$WORK_DIR/utils.py" inspect \
+    /DATA/G17/ego4d_data/v2/annotations/av_train.json || true   # non-fatal
+
+# ── 3. GPU / VRAM check ───────────────────────────────────────────────────────
+echo ""
+echo ">>> [3/5] GPU info …"
+python - <<'EOF'
+import torch
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print(f"  GPU   : {props.name}")
+    print(f"  VRAM  : {props.total_memory/1e9:.1f} GB")
+    print(f"  BF16  : {torch.cuda.is_bf16_supported()}")
+else:
+    print("  WARNING: No CUDA device found!")
+EOF
+
+# ── 4. Train ──────────────────────────────────────────────────────────────────
+if [ "$SKIP_TRAIN" -eq 0 ]; then
+    echo ""
+    echo ">>> [4/5] Training WhisperTTM …"
+
+    RESUME_FLAG=""
+    if [ -n "$CHECKPOINT" ]; then
+        RESUME_FLAG="--resume $CHECKPOINT"
+    fi
+
+    python "$WORK_DIR/train_audio.py" \
+        --config "$CONFIG" \
+        $RESUME_FLAG
+
+    # Find best checkpoint
+    CHECKPOINT=$(python - <<'EOF'
+import os, glob, torch
+ckpts = glob.glob("/DATA/G17/outputs/ttm_audio/checkpoints/ckpt_best.pt")
+print(ckpts[0] if ckpts else "")
+EOF
+)
+    echo "Best checkpoint: $CHECKPOINT"
+else
+    echo ""
+    echo ">>> [4/5] Skipping training (SKIP_TRAIN=1)"
+fi
+
+# ── 5. Extract embeddings ─────────────────────────────────────────────────────
+echo ""
+echo ">>> [5/5] Extracting timestamped embeddings …"
+
+CKPT_FLAG=""
+if [ -n "$CHECKPOINT" ]; then
+    CKPT_FLAG="--checkpoint $CHECKPOINT"
+fi
+
+# Train split
+python "$WORK_DIR/extract_embeddings.py" \
+    --config "$CONFIG" \
+    --split train \
+    --device "$DEVICE" \
+    $CKPT_FLAG
+
+# Val split
+python "$WORK_DIR/extract_embeddings.py" \
+    --config "$CONFIG" \
+    --split val \
+    --device "$DEVICE" \
+    $CKPT_FLAG
+
+# ── 6. Sanity check ───────────────────────────────────────────────────────────
+echo ""
+echo ">>> Sanity-checking extracted embeddings …"
+python "$WORK_DIR/utils.py" sanity --config "$CONFIG" --split train --n 5
+python "$WORK_DIR/utils.py" sanity --config "$CONFIG" --split val   --n 3
+
+echo ""
+echo "=================================================================="
+echo "  Pipeline complete!"
+echo "  Embeddings saved to: /DATA/G17/outputs/ttm_audio/embeddings/"
+echo "    train/  →  one .pt file per clip_uid"
+echo "    val/    →  one .pt file per clip_uid"
+echo ""
+echo "  Each .pt file contains:"
+echo "    'embeddings'     : Tensor (N, 512)   – projected Whisper features"
+echo "    'timestamps_sec' : Tensor (N,)        – absolute time of each frame"
+echo "    'frame_step_sec' : float              – ~0.020 s between frames"
+echo "    'clip_uid'       : str"
+echo "    'video_uid'      : str"
+echo "=================================================================="
+
+

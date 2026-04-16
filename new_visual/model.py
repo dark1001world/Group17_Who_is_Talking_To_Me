@@ -522,10 +522,398 @@ class FactorisedViTTTM(nn.Module):
 #  Registry + factory
 # ──────────────────────────────────────────────────────────────
 
+# MODEL_REGISTRY: dict[str, type] = {
+#     "VideoSwinV2TTM"   : VideoSwinV2TTM,
+#     "TimeSformerTTM"   : TimeSformerTTM,
+#     "FactorisedViTTTM" : FactorisedViTTTM,
+# }
+
+
+# def build_model(name: str, **kwargs) -> nn.Module:
+#     if name not in MODEL_REGISTRY:
+#         raise ValueError(
+#             f"Unknown model '{name}'. "
+#             f"Choose from: {list(MODEL_REGISTRY.keys())}"
+#         )
+#     return MODEL_REGISTRY[name](**kwargs)
+
+
+
+"""
+DINO ViT + Track Features Extension
+=====================================
+ADD THIS TO THE BOTTOM OF YOUR EXISTING model.py
+
+Preserves all existing models (VideoSwinV2TTM, TimeSformerTTM, FactorisedViTTTM).
+Adds two new models:
+  - DinoViTTTM         : DINO ViT-B/16 + temporal transformer
+  - DinoViTTrackTTM    : DINO ViT-B/16 + track spatial features + temporal transformer
+
+Usage: just append this file content to your existing model.py
+Then add the new models to MODEL_REGISTRY at the bottom.
+"""
+
+# ──────────────────────────────────────────────────────────────
+#  Track Feature Projector
+# ──────────────────────────────────────────────────────────────
+
+class TrackFeatureProjector(nn.Module):
+    """
+    Projects 6-dim spatial track features to match ViT embedding dim.
+    
+    Input:  [B, T, 6]   (cx, cy, size, dx, dy, ds)
+    Output: [B, T, dim]
+    """
+
+    def __init__(self, in_dim: int = 6, out_dim: int = 768, dropout: float = 0.1):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, out_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(x)
+
+
+# ──────────────────────────────────────────────────────────────
+#  DINO ViT TTM  (visual only, no track features)
+# ──────────────────────────────────────────────────────────────
+
+class DinoViTTTM(nn.Module):
+    """
+    DINO ViT-B/16 for TTM binary classification.
+
+    Why better than Swin3D:
+      - Pretrained with self-supervised learning on ImageNet
+      - Naturally attends to faces and objects (not scene motion)
+      - Better transfer to face crop domain
+      - Lighter than Swin3D (86M vs 54M but more efficient for faces)
+
+    Architecture:
+      ViT-B/16 per-frame CLS tokens → temporal transformer → cross-attn head
+
+    Input:  [B, C, T, H, W]
+    Output: [B, 2]
+    """
+
+    def __init__(
+        self,
+        vit_variant    : str   = "vit_base_patch16_224",
+        pretrained     : bool  = True,
+        num_frames     : int   = 8,
+        num_classes    : int   = 2,
+        temporal_depth : int   = 2,
+        dropout        : float = 0.2,
+        freeze_backbone: bool  = True,
+    ):
+        super().__init__()
+
+        if not HAS_TIMM:
+            raise ImportError("timm required: pip install timm>=0.9.12")
+
+        # ── DINO ViT backbone ──
+        self.backbone = timm.create_model(
+            vit_variant,
+            pretrained  = pretrained,
+            num_classes = 0,
+            global_pool = "token",   # returns CLS token [B, D]
+        )
+        feat_dim = self.backbone.embed_dim
+        self.num_frames = num_frames
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            print(f"[DinoViTTTM] Backbone frozen")
+
+        # ── temporal position embedding ──
+        self.temporal_pos = nn.Parameter(torch.zeros(1, num_frames, feat_dim))
+        nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+
+        # ── temporal transformer ──
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = feat_dim,
+            nhead           = feat_dim // 64,
+            dim_feedforward = feat_dim * 4,
+            dropout         = dropout,
+            activation      = "gelu",
+            batch_first     = True,
+            norm_first      = True,
+        )
+        self.temporal_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers           = temporal_depth,
+            enable_nested_tensor = False,
+        )
+
+        # ── classification head ──
+        self.head = CrossAttentionTemporalHead(
+            dim         = feat_dim,
+            num_heads   = feat_dim // 64,
+            dropout     = dropout,
+            num_classes = num_classes,
+        )
+
+        trainable = count_params(self)
+        total     = count_params(self, only_trainable=False)
+        print(f"[DinoViTTTM] variant={vit_variant}  "
+              f"trainable={trainable/1e6:.1f}M / {total/1e6:.1f}M")
+
+    def forward(self, x: Tensor, track: Tensor = None) -> Tensor:
+        """
+        x:     [B, C, T, H, W]
+        track: ignored (for API compatibility with DinoViTTrackTTM)
+        """
+        B, C, T, H, W = x.shape
+
+        # per-frame CLS tokens
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        cls    = self.backbone(x_flat)           # [B*T, D]
+        cls    = cls.view(B, T, -1)              # [B, T, D]
+
+        # temporal modelling
+        cls = cls + self.temporal_pos[:, :T]
+        cls = self.temporal_transformer(cls)     # [B, T, D]
+
+        return self.head(cls)                    # [B, 2]
+
+    def extract_tokens(self, x: Tensor, track: Tensor = None) -> dict:
+        """Extract intermediate features for fusion."""
+        B, C, T, H, W = x.shape
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        cls    = self.backbone(x_flat).view(B, T, -1)
+        cls    = cls + self.temporal_pos[:, :T]
+        tokens = self.temporal_transformer(cls)
+
+        # cross-attention
+        cls_q = self.head.cls_token.expand(B, -1, -1)
+        normed = self.head.norm1(tokens)
+        attended, attn_w = self.head.cross_attn(
+            query=cls_q, key=normed, value=normed, need_weights=True
+        )
+        cls_vec    = (cls_q + attended).squeeze(1)
+        logits     = self.head.head(cls_vec)
+        confidence = torch.softmax(logits, dim=1)[:, 1]
+
+        return {
+            "frame_tokens" : tokens,
+            "cls_embedding": cls_vec,
+            "attn_weights" : attn_w.squeeze(1),
+            "confidence"   : confidence,
+            "logits"       : logits,
+        }
+
+
+# ──────────────────────────────────────────────────────────────
+#  DINO ViT + Track Features TTM  (PRIMARY NEW MODEL)
+# ──────────────────────────────────────────────────────────────
+
+class DinoViTTrackTTM(nn.Module):
+    """
+    DINO ViT-B/16 + Spatial Track Features for TTM.
+
+    Track features (from json_original bounding boxes):
+      cx, cy   = normalized face center position
+      size     = normalized face area (how close to camera)
+      dx, dy   = frame-to-frame movement (head motion)
+      ds       = face size change (moving toward/away camera)
+
+    Why this beats Swin3D alone:
+      - DINO gives rich face-aware visual features
+      - Track features give explicit spatial/motion context
+      - Together: model knows WHAT the face looks like AND WHERE/HOW it moves
+      - TTM signal: face centered + stable + large = looking at camera
+
+    Architecture:
+      DINO CLS [B,T,D] + Track projection [B,T,D]
+          ↓ element-wise add (gated)
+      Temporal Transformer
+          ↓
+      CrossAttention Head → [B, 2]
+
+    Input:  x [B, C, T, H, W],  track [B, T, 6]
+    Output: [B, 2]
+    """
+
+    def __init__(
+        self,
+        vit_variant    : str   = "vit_base_patch16_224",
+        pretrained     : bool  = True,
+        num_frames     : int   = 8,
+        num_classes    : int   = 2,
+        temporal_depth : int   = 2,
+        dropout        : float = 0.2,
+        freeze_backbone: bool  = True,
+        track_dim      : int   = 6,
+    ):
+        super().__init__()
+
+        if not HAS_TIMM:
+            raise ImportError("timm required: pip install timm>=0.9.12")
+
+        # ── DINO ViT backbone ──
+        self.backbone = timm.create_model(
+            vit_variant,
+            pretrained  = pretrained,
+            num_classes = 0,
+            global_pool = "token",
+        )
+        feat_dim = self.backbone.embed_dim
+        self.num_frames = num_frames
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            print(f"[DinoViTTrackTTM] Backbone frozen")
+
+        # ── temporal position embedding ──
+        self.temporal_pos = nn.Parameter(torch.zeros(1, num_frames, feat_dim))
+        nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+
+        # ── track feature projector ──
+        self.track_proj = TrackFeatureProjector(
+            in_dim  = track_dim,
+            out_dim = feat_dim,
+            dropout = dropout,
+        )
+
+        # ── learnable gate: how much to trust track vs visual ──
+        self.track_gate = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_dim),
+            nn.Sigmoid(),
+        )
+
+        # ── temporal transformer ──
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = feat_dim,
+            nhead           = feat_dim // 64,
+            dim_feedforward = feat_dim * 4,
+            dropout         = dropout,
+            activation      = "gelu",
+            batch_first     = True,
+            norm_first      = True,
+        )
+        self.temporal_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers           = temporal_depth,
+            enable_nested_tensor = False,
+        )
+
+        # ── classification head ──
+        self.head = CrossAttentionTemporalHead(
+            dim         = feat_dim,
+            num_heads   = feat_dim // 64,
+            dropout     = dropout,
+            num_classes = num_classes,
+        )
+
+        trainable = count_params(self)
+        total     = count_params(self, only_trainable=False)
+        print(f"[DinoViTTrackTTM] variant={vit_variant}  "
+              f"trainable={trainable/1e6:.1f}M / {total/1e6:.1f}M")
+
+    def forward(self, x: Tensor, track: Tensor) -> Tensor:
+        """
+        x:     [B, C, T, H, W]   visual clip
+        track: [B, T, 6]          spatial track features
+        """
+        B, C, T, H, W = x.shape
+
+        # ── visual features ──
+        x_flat  = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        vis_cls = self.backbone(x_flat).view(B, T, -1)   # [B, T, D]
+
+        # ── track features ──
+        # pad/trim track to match T
+        if track.size(1) != T:
+            track = track[:, :T] if track.size(1) > T \
+                    else torch.cat([
+                        track,
+                        track[:, -1:].expand(-1, T - track.size(1), -1)
+                    ], dim=1)
+
+        track_proj = self.track_proj(track)               # [B, T, D]
+
+        # ── gated fusion ──
+        gate   = self.track_gate(
+            torch.cat([vis_cls, track_proj], dim=-1)
+        )                                                  # [B, T, D]
+        tokens = vis_cls + gate * track_proj              # [B, T, D]
+
+        # ── temporal modelling ──
+        tokens = tokens + self.temporal_pos[:, :T]
+        tokens = self.temporal_transformer(tokens)        # [B, T, D]
+
+        return self.head(tokens)                          # [B, 2]
+
+    def extract_tokens(self, x: Tensor, track: Tensor) -> dict:
+        """Extract intermediate features for fusion."""
+        B, C, T, H, W = x.shape
+        x_flat     = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        vis_cls    = self.backbone(x_flat).view(B, T, -1)
+
+        # Keep track features time-aligned with video tokens (same logic as forward).
+        if track.size(1) != T:
+            track = track[:, :T] if track.size(1) > T \
+                    else torch.cat([
+                        track,
+                        track[:, -1:].expand(-1, T - track.size(1), -1)
+                    ], dim=1)
+
+        track_proj = self.track_proj(track)
+        gate       = self.track_gate(torch.cat([vis_cls, track_proj], dim=-1))
+        tokens     = vis_cls + gate * track_proj
+        tokens     = tokens + self.temporal_pos[:, :T]
+        tokens     = self.temporal_transformer(tokens)
+
+        cls_q  = self.head.cls_token.expand(B, -1, -1)
+        normed = self.head.norm1(tokens)
+        attended, attn_w = self.head.cross_attn(
+            query=cls_q, key=normed, value=normed, need_weights=True
+        )
+        cls_vec    = (cls_q + attended).squeeze(1)
+        logits     = self.head.head(cls_vec)
+        confidence = torch.softmax(logits, dim=1)[:, 1]
+
+        return {
+            "frame_tokens" : tokens,
+            "cls_embedding": cls_vec,
+            "attn_weights" : attn_w.squeeze(1),
+            "confidence"   : confidence,
+            "logits"       : logits,
+            "track_gate"   : gate,         # bonus: how much track was used
+        }
+
+
+# ──────────────────────────────────────────────────────────────
+#  UPDATE MODEL_REGISTRY  (replace existing registry at bottom
+#  of your model.py with this)
+# ──────────────────────────────────────────────────────────────
+
 MODEL_REGISTRY: dict[str, type] = {
-    "VideoSwinV2TTM"   : VideoSwinV2TTM,
-    "TimeSformerTTM"   : TimeSformerTTM,
-    "FactorisedViTTTM" : FactorisedViTTTM,
+    # ── existing models (preserved) ──
+    "VideoSwinV2TTM"    : VideoSwinV2TTM,
+    "TimeSformerTTM"    : TimeSformerTTM,
+    "FactorisedViTTTM"  : FactorisedViTTTM,
+    # ── new models ──
+    "DinoViTTTM"        : DinoViTTTM,
+    "DinoViTTrackTTM"   : DinoViTTrackTTM,
 }
 
 
@@ -536,8 +924,6 @@ def build_model(name: str, **kwargs) -> nn.Module:
             f"Choose from: {list(MODEL_REGISTRY.keys())}"
         )
     return MODEL_REGISTRY[name](**kwargs)
-
-
 # ──────────────────────────────────────────────────────────────
 #  Quick shape test
 # ──────────────────────────────────────────────────────────────

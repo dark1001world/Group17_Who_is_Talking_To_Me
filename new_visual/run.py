@@ -18,6 +18,7 @@ import json
 import os
 import random
 import sys
+import math
 from pathlib import Path
 
 import torch
@@ -30,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data_loader import ViTVisualConfig, get_loader, mixup_batch
 from model import build_model
 from engine import (
-    ModelEMA, WeightedCrossEntropyLoss,
+    ModelEMA, WeightedBinaryCrossEntropyLoss,
     get_amp_dtype,
     train, validate, infer,
     save_checkpoint, load_checkpoint,
@@ -88,8 +89,15 @@ def parse_args():
     # ── model ──
     g = p.add_argument_group("Model")
     g.add_argument("--model", default="VideoSwinV2TTM",
-                   choices=["VideoSwinV2TTM", "TimeSformerTTM", "FactorisedViTTTM"],
+                   choices=["VideoSwinV2TTM", "TimeSformerTTM", "FactorisedViTTTM", "DinoViTTTM", "DinoViTTrackTTM"],
                    help="Model architecture")
+    g.add_argument("--use_track",        action="store_true", default=True,
+                   help="Use spatial track features from json_original")
+    g.add_argument("--freeze_backbone",  action="store_true", default=True,
+                   help="Freeze ViT backbone (for DINO models)")
+    g.add_argument("--no_freeze_backbone", action="store_false", dest="freeze_backbone")
+    g.add_argument("--temporal_depth",   type=int, default=2,
+                   help="Number of temporal transformer layers")
     g.add_argument("--variant", default="swin3d_s",
                    help="Backbone variant: swin3d_s | swin3d_b | vit_small_patch16_224 | ...")
     g.add_argument("--clip_frames",    type=int,   default=8,
@@ -110,6 +118,8 @@ def parse_args():
     g.add_argument("--batch_size",   type=int, default=16,
                    help="Per-GPU batch size (ViT uses more VRAM than CNN)")
     g.add_argument("--num_workers",  type=int, default=4)
+    g.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="Accumulate gradients over this many mini-batches to increase effective batch size")
     g.add_argument("--mixup",        action="store_true", default=False)
     g.add_argument("--no_mixup",     action="store_false", dest="mixup")
     g.add_argument("--mixup_alpha",  type=float, default=0.2)
@@ -132,6 +142,10 @@ def parse_args():
     g.add_argument("--ema",           action="store_true", default=True)
     g.add_argument("--no_ema",        action="store_false", dest="ema")
     g.add_argument("--ema_decay",     type=float, default=0.9998)
+    g.add_argument("--early_stop_patience", type=int, default=6,
+                   help="Stop after this many epochs without meaningful mAP improvement (<=0 disables)")
+    g.add_argument("--early_stop_min_delta", type=float, default=1e-4,
+                   help="Minimum mAP gain to reset early-stopping counter")
     g.add_argument("--amp",           action="store_true", default=True)
     g.add_argument("--no_amp",        action="store_false", dest="amp")
     g.add_argument("--compile",       action="store_true",
@@ -160,22 +174,30 @@ def build_optimizer(model: nn.Module, args) -> optim.AdamW:
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(k in name for k in [
-            "temporal_head", "cls_token", "temporal_pos"
-        ]):
-            head_params.append(param)
-        else:
+        # Use explicit module prefix split: everything under backbone uses scaled LR,
+        # everything else (temporal/fusion/classifier heads) uses base LR.
+        if name.startswith("backbone."):
             backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    backbone_lr = args.lr * args.backbone_lr_scale
+    head_lr = args.lr
 
     print(f"[Optimizer] backbone={len(backbone_params)} params  "
           f"head={len(head_params)} params")
+    print(f"[Optimizer] lr_backbone={backbone_lr:.2e}  lr_head={head_lr:.2e}")
 
-    return optim.AdamW([
-        {"params": backbone_params, "lr": args.lr},        # ← same LR, no scaling
-        {"params": head_params,     "lr": args.lr * 2},   # ← head gets 2x higher LR
-    ],
-        weight_decay = args.weight_decay,
-        betas        = (0.9, 0.999),
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": backbone_lr})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": head_lr})
+
+    return optim.AdamW(
+        param_groups,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
     )
 
 # ──────────────────────────────────────────────────────────────
@@ -211,11 +233,16 @@ def main():
     model_kwargs = dict(pretrained=True, num_classes=2, dropout=args.dropout)
 
     if args.model == "VideoSwinV2TTM":
-        model_kwargs["variant"]       = args.variant
-        model_kwargs["freeze_stages"] = args.freeze_stages
+        model_kwargs["variant"]         = args.variant
+        model_kwargs["freeze_stages"]   = args.freeze_stages
     elif args.model in ("TimeSformerTTM", "FactorisedViTTTM"):
-        model_kwargs["vit_variant"]   = args.variant
-        model_kwargs["num_frames"]    = args.clip_frames
+        model_kwargs["vit_variant"]     = args.variant
+        model_kwargs["num_frames"]      = args.clip_frames
+    elif args.model in ("DinoViTTTM", "DinoViTTrackTTM"):
+        model_kwargs["vit_variant"]     = args.variant
+        model_kwargs["num_frames"]      = args.clip_frames
+        model_kwargs["temporal_depth"]  = args.temporal_depth
+        model_kwargs["freeze_backbone"] = args.freeze_backbone
 
     model = build_model(args.model, **model_kwargs).to(device)
 
@@ -257,6 +284,7 @@ def main():
         test_stride  = args.test_stride,
         batch_size   = args.batch_size,
         num_workers  = args.num_workers,
+        use_track    = args.use_track,
         # use_mixup    = args.mixup,
         # mixup_alpha  = args.mixup_alpha,
     )
@@ -276,14 +304,15 @@ def main():
 
     # ── loss ──
     class_weights = torch.FloatTensor(args.weights).to(device)
-    criterion = WeightedCrossEntropyLoss(
+    criterion = WeightedBinaryCrossEntropyLoss(
         weight          = class_weights,
         label_smoothing = args.label_smoothing,
     )
 
     # ── scheduler ──
-    total_steps  = args.epochs * len(train_loader)
-    warmup_steps = args.warmup_epochs * len(train_loader)
+    update_steps_per_epoch = math.ceil(len(train_loader) / max(args.grad_accum_steps, 1))
+    total_steps  = args.epochs * update_steps_per_epoch
+    warmup_steps = args.warmup_epochs * update_steps_per_epoch
     scheduler = CosineWarmupScheduler(
         optimizer,
         warmup_steps = warmup_steps,
@@ -313,11 +342,18 @@ def main():
     print(f"  Device     : {device}  AMP={args.amp} ({amp_dtype})")
     print(f"  Epochs     : {start_epoch} → {args.epochs}")
     print(f"  Batch size : {args.batch_size}")
+    print(f"  Grad accum : {args.grad_accum_steps} (effective batch ~ {args.batch_size * args.grad_accum_steps})")
     print(f"  Clip       : {args.clip_frames} frames @ {args.img_size}px")
     print(f"  EMA        : {ema is not None}")
     print(f"  MixUp      : {args.mixup}")
     print(f"  Best mAP   : {best_mAP:.4f}")
+    if args.early_stop_patience > 0:
+        print(f"  Early stop : patience={args.early_stop_patience}  min_delta={args.early_stop_min_delta}")
+    else:
+        print("  Early stop : disabled")
     print(f"{'─'*60}\n")
+
+    no_improve_epochs = 0
 
     for epoch in range(start_epoch, args.epochs):
 
@@ -333,6 +369,7 @@ def main():
             amp_dtype    = amp_dtype,
             mixup_fn     = mixup_fn,
             grad_clip    = args.grad_clip,
+            grad_accum_steps = args.grad_accum_steps,
             scheduler=scheduler,
         )
 
@@ -340,10 +377,15 @@ def main():
 
         # validate with EMA model if available
         val_model = ema.model if ema else model
-        mAP = validate(val_loader, val_model, device, amp_dtype, "val")
+        mAP, auc = validate(val_loader, val_model, device, amp_dtype, "val", criterion)
 
-        is_best  = mAP > best_mAP
-        best_mAP = max(mAP, best_mAP)
+        improved = (mAP - best_mAP) > args.early_stop_min_delta
+        is_best  = improved
+        if improved:
+            best_mAP = mAP
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
 
         ckpt_state = {
             "epoch"      : epoch,
@@ -352,6 +394,7 @@ def main():
             "optimizer"  : optimizer.state_dict(),
             "scheduler"  : scheduler.state_dict(),
             "mAP"        : mAP,
+            "auc"        : auc,
             "args"       : vars(args),
         }
         save_checkpoint(
@@ -364,8 +407,12 @@ def main():
         lr_now = optimizer.param_groups[-1]["lr"]
         tag    = " ← BEST" if is_best else ""
         print(f"[Epoch {epoch:3d}] loss={train_loss:.4f}  "
-              f"mAP={mAP:.4f}  best={best_mAP:.4f}  "
+              f"mAP={mAP:.4f}  auc={auc:.4f}  best={best_mAP:.4f}  "
               f"lr={lr_now:.2e}{tag}\n")
+
+        if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
+            print(f"[Early Stop] No meaningful mAP improvement for {no_improve_epochs} epochs. Stopping at epoch {epoch}.")
+            break
 
     print(f"\n{'─'*60}")
     print(f"  Training complete")

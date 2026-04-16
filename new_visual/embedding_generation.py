@@ -7,12 +7,13 @@ Input:
   - /DATA/G17/Data/video/<uid>/img_*.jpg
 
 Output:
-  - one JSON file per UID containing segment records with:
-	  uid, person_id, label, tag, start_frame, end_frame, embedding
+	- single JSON file visual_embedding.json containing segment records with:
+	  uid, label, tags, start_frame, end_frame, embedding
 
-The embedding is a 512-d vector derived from the VideoSwinV2TTM temporal head.
-If the model hidden size differs from 512, the vector is padded or truncated
-to keep the output dimension stable.
+The embedding is derived from the VideoSwinV2TTM temporal head.
+By default, embeddings are saved at the model's native hidden size.
+If a smaller target dimension is requested, embeddings are truncated.
+No zero-padding is applied.
 """
 
 from __future__ import annotations
@@ -198,19 +199,24 @@ def sample_items(items: list[dict], clip_frames: int) -> list[dict]:
 	return repeated[:clip_frames]
 
 
-def force_embedding_dim(embedding: torch.Tensor, embedding_dim: int = 512) -> torch.Tensor:
+def force_embedding_dim(
+	embedding: torch.Tensor,
+	embedding_dim: int | None = None,
+) -> torch.Tensor:
+	if embedding_dim is None:
+		return embedding
+
 	current_dim = embedding.shape[-1]
 	if current_dim == embedding_dim:
 		return embedding
 	if current_dim > embedding_dim:
 		return embedding[..., :embedding_dim]
 
-	pad_width = embedding_dim - current_dim
-	return torch.nn.functional.pad(embedding, (0, pad_width))
+	return embedding
 
 
 @torch.no_grad()
-def encode_clip(model, clip: torch.Tensor, embedding_dim: int = 512) -> torch.Tensor:
+def encode_clip(model, clip: torch.Tensor, embedding_dim: int | None = None) -> torch.Tensor:
 	feats = model.backbone(clip)
 	d_expected = model.temporal_head.cls_token.shape[-1]
 
@@ -268,9 +274,6 @@ def load_model(args, device: torch.device):
 
 def choose_uids(args) -> list[str]:
 	ttm_dir = Path(args.ttm_dir)
-	if args.split in {"train", "val"}:
-		split_file = Path(args.starter_code) / "data" / "split" / f"{args.split}.list"
-		return load_uid_list(split_file)
 	return sorted(path.stem for path in ttm_dir.glob("*.json"))
 
 
@@ -281,20 +284,22 @@ def build_segment_embeddings(args):
 	ttm_dir = Path(args.ttm_dir)
 	json_root = Path(args.json_path)
 	frames_root = Path(args.frames_root)
-	out_root = Path(args.output) / args.split
+	out_root = Path(args.output)
 	out_root.mkdir(parents=True, exist_ok=True)
 
 	transform = build_val_transform(args.img_size)
 	model = load_model(args, device)
 
 	uids = choose_uids(args)
-	logger.info("Processing %d UIDs for split=%s", len(uids), args.split)
+	logger.info("Processing %d UIDs from full dataset", len(uids))
 
 	saved = 0
 	skipped = 0
 	pos = 0
 	neg = 0
 	all_segments: list[dict] = []
+
+	resolved_embedding_dim: int | None = args.embedding_dim if args.embedding_dim > 0 else None
 
 	for uid in uids:
 		ttm_path = ttm_dir / f"{uid}.json"
@@ -364,7 +369,7 @@ def build_segment_embeddings(args):
 
 			clip = torch.stack(processed_frames, dim=1).unsqueeze(0).to(device)
 			try:
-				embedding = encode_clip(model, clip, embedding_dim=args.embedding_dim)
+				embedding = encode_clip(model, clip, embedding_dim=resolved_embedding_dim)
 			except Exception as exc:
 				logger.error(
 					"Embedding failed for %s %d-%d: %s",
@@ -378,9 +383,8 @@ def build_segment_embeddings(args):
 			out_segments.append(
 				{
 					"uid": uid,
-					"person_id": person_id,
-					"label": label,
-					"tag": tag_value,
+					"label": person_id,
+					"tags": label,
 					"start_frame": start_frame,
 					"end_frame": end_frame,
 					"embedding": embedding.squeeze(0).cpu().tolist(),
@@ -403,8 +407,11 @@ def build_segment_embeddings(args):
 	if out_file.exists() and not args.overwrite:
 		logger.info("Output already exists and --overwrite is not set: %s", out_file)
 	else:
+		meta_dim = resolved_embedding_dim
+		if meta_dim is None and all_segments:
+			meta_dim = len(all_segments[0].get("embedding", []))
 		with open(out_file, "w") as f:
-			json.dump({"segments": all_segments}, f, indent=2)
+			json.dump({"segments": all_segments, "embedding_dim": meta_dim}, f, indent=2)
 		logger.info("Wrote %d segments to %s", len(all_segments), out_file)
 
 	logger.info(
@@ -442,7 +449,7 @@ def parse_args():
 	parser.add_argument(
 		"--output",
 		default="/DATA/G17/outputs/visual_segment_embeddings",
-		help="Output directory for per-UID embedding JSON files",
+		help="Output directory where visual_embedding.json is written",
 	)
 	parser.add_argument(
 		"--checkpoint",
@@ -451,9 +458,9 @@ def parse_args():
 	)
 	parser.add_argument(
 		"--split",
-		default="train",
+		default="all",
 		choices=["train", "val", "all"],
-		help="Which UID list to process",
+		help="Deprecated: ignored, full dataset is always processed",
 	)
 	parser.add_argument(
 		"--variant",
@@ -493,8 +500,8 @@ def parse_args():
 	parser.add_argument(
 		"--embedding_dim",
 		type=int,
-		default=512,
-		help="Final embedding dimension written to JSON",
+		default=0,
+		help="Target embedding dimension (<=0 keeps native model dimension; no zero-padding)",
 	)
 	parser.add_argument(
 		"--pretrained",

@@ -50,6 +50,7 @@ class ViTVisualConfig:
     num_workers  : int   = 10
     pin_memory   : bool  = True
     min_seg_frames: int  = 8      # skip segments shorter than this
+    use_track    : bool  = False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -58,6 +59,12 @@ class ViTVisualConfig:
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+# Per-process caches. Each DataLoader worker gets its own copy, which still
+# removes the repeated JSON parsing cost within that worker.
+_FACE_BBOX_CACHE: dict[tuple[str, str], dict[str, tuple[int, int, int, int]]] = {}
+_TRACK_FRAME_CACHE: dict[tuple[str, str], dict[int, dict]] = {}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -148,9 +155,15 @@ def _load_frame(p: str) -> Image.Image:
 
 def _load_face_bboxes(uid: str, json_root: str) -> dict[str, tuple[int, int, int, int]]:
     """Load per-frame face boxes keyed by '<frame>:<personid>' for one UID."""
+    cache_key = (json_root, uid)
+    cached = _FACE_BBOX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     uid_dir = os.path.join(json_root, uid)
     if not os.path.isdir(uid_dir):
-        return {}
+        _FACE_BBOX_CACHE[cache_key] = {}
+        return _FACE_BBOX_CACHE[cache_key]
 
     out: dict[str, tuple[int, int, int, int]] = {}
     for track_file in glob.glob(os.path.join(uid_dir, "*.json")):
@@ -184,6 +197,7 @@ def _load_face_bboxes(uid: str, json_root: str) -> dict[str, tuple[int, int, int
             except (KeyError, TypeError, ValueError):
                 continue
 
+    _FACE_BBOX_CACHE[cache_key] = out
     return out
 
 
@@ -220,6 +234,103 @@ def _resolve_frame_path(frame_dir: str, fid: int) -> str | None:
     return None
 
 
+def _load_track_frame_map(uid: str, json_path: str) -> dict[str, dict]:
+    """Load (and cache) '<frame>:<personid>' -> raw track entry map for one UID."""
+    cache_key = (json_path, uid)
+    cached = _TRACK_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    track_dir = os.path.join(json_path, uid)
+    if not os.path.isdir(track_dir):
+        _TRACK_FRAME_CACHE[cache_key] = {}
+        return _TRACK_FRAME_CACHE[cache_key]
+
+    frame_bbox: dict[str, dict] = {}
+    for track_file in os.listdir(track_dir):
+        if not track_file.endswith('.json'):
+            continue
+        try:
+            entries = _load_json(os.path.join(track_dir, track_file))
+            for e in entries:
+                fid = e.get('frameNumber')
+                pid_raw = e.get('Person ID', "")
+                pid = str(pid_raw).replace("'", "")
+                if fid is None or not pid:
+                    continue
+                key = f"{int(fid)}:{pid}"
+                if key not in frame_bbox:
+                    frame_bbox[key] = e
+        except Exception:
+            continue
+
+    _TRACK_FRAME_CACHE[cache_key] = frame_bbox
+    return frame_bbox
+
+def _load_track_features(
+    uid      : str,
+    json_path: str,
+    personid : int,
+    fids     : list[int],
+    frame_w  : int = 1920,
+    frame_h  : int = 1080,
+    frame_bbox: dict[str, dict] | None = None,
+) -> "torch.Tensor":
+    """
+    Load per-frame spatial features from track JSONs in json_original/.
+ 
+    Features per frame (6 total):
+      cx, cy : normalized face center (0-1)
+      size   : normalized face area   (0-1)
+      dx, dy : frame-to-frame movement
+      ds     : face size change
+ 
+    Returns [T, 6] float32 tensor.
+    Falls back to zeros if track data unavailable.
+    """
+    import torch
+ 
+    T = len(fids)
+
+    if frame_bbox is None:
+        frame_bbox = _load_track_frame_map(uid, json_path)
+ 
+    if not frame_bbox:
+        return torch.zeros(T, 6, dtype=torch.float32)
+ 
+    # ── extract features per requested frame ──
+    feats = []
+    prev_cx, prev_cy, prev_size = 0.5, 0.5, 0.05
+ 
+    pid = str(personid)
+    for fid in fids:
+        key = f"{int(fid)}:{pid}"
+        if key in frame_bbox:
+            e  = frame_bbox[key]
+            x  = float(e.get('x', prev_cx * frame_w))
+            y  = float(e.get('y', prev_cy * frame_h))
+            h  = float(e.get('height', 0.0))
+            w  = float(e.get('width',  0.0))
+            cx = (x + 0.5 * w) / max(frame_w, 1)
+            cy = (y + 0.5 * h) / max(frame_h, 1)
+            size = (h * w) / (frame_w * frame_h + 1e-6)
+            # clamp to valid range
+            cx   = max(0.0, min(1.0, cx))
+            cy   = max(0.0, min(1.0, cy))
+            size = max(0.0, min(1.0, size))
+        else:
+            # use previous frame values (person still there)
+            cx, cy, size = prev_cx, prev_cy, prev_size
+ 
+        dx = cx   - prev_cx
+        dy = cy   - prev_cy
+        ds = size - prev_size
+ 
+        feats.append([cx, cy, size, dx, dy, ds])
+        prev_cx, prev_cy, prev_size = cx, cy, size
+ 
+    return torch.tensor(feats, dtype=torch.float32)   # [T, 6]
+ 
 # ──────────────────────────────────────────────────────────────
 #  Sample builder
 # ──────────────────────────────────────────────────────────────
@@ -305,13 +416,14 @@ def _build_samples(
             if not p:
                 continue
             key = f"{f}:{personid}"
-            frame_items.append({"path": p, "bbox": face_bboxes.get(key)})
+            frame_items.append({"path": p, "bbox": face_bboxes.get(key), "fid": f})
 
         if len(frame_items) >= 2:
             samples.append({
                 "uid"     : uid,
                 "personid": personid,
                 "frames"  : frame_items,
+                "fids"    : [it["fid"] for it in frame_items],
                 "label"   : label,
             })
 
@@ -332,8 +444,9 @@ def _sample_clip(
         raise ValueError("Empty frame list")
 
     if n < clip_frames:
-        # repeat-pad
-        return (paths * ((clip_frames // n) + 1))[:clip_frames]
+        # For short clips, pad with the last frame to avoid cyclic temporal jumps.
+        # Cyclic repetition (e.g., 0,1,2,0,1,2) creates artificial motion spikes.
+        return paths + [paths[-1]] * (clip_frames - n)
 
     if training:
         # random temporal crop
@@ -358,18 +471,20 @@ class ViTImagerLoader(Dataset):
         self,
         source_path   : str,
         split_file    : str,
-        json_path     : str,
         gt_path       : str,
         stride        : int  = 4,
         clip_frames   : int  = 16,
         img_size      : int  = 128,
         min_seg_frames: int  = 8,
         mode          : Literal["train", "val"] = "train",
+        json_path     : str  = "",
+        use_track     : bool = False,       # ← ADD THIS
     ):
         self.clip_frames = clip_frames
         self.training    = (mode == "train")
         self.img_size    = img_size
-
+        self.use_track = use_track
+        self.json_path = json_path
         # transforms
         self.train_transform = ConsistentClipTransform(img_size)
         self.val_transform   = get_val_transform(img_size)
@@ -383,6 +498,14 @@ class ViTImagerLoader(Dataset):
                 _build_samples(uid, gt_path, source_path, json_path, stride, min_seg_frames)
             )
 
+        # Preload track maps in parent process before DataLoader workers fork.
+        # Workers then reuse these read-mostly structures without re-parsing JSON files.
+        self._track_frame_maps: dict[str, dict[str, dict]] = {}
+        if self.use_track and self.json_path:
+            unique_uids = {s["uid"] for s in self.samples}
+            for uid in unique_uids:
+                self._track_frame_maps[uid] = _load_track_frame_map(uid, self.json_path)
+
         pos = sum(s["label"] == 1 for s in self.samples)
         neg = len(self.samples) - pos
         print(f"[ViTLoader] '{mode}': {len(self.samples)} samples  "
@@ -391,23 +514,49 @@ class ViTImagerLoader(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, int]:
+    def __getitem__(self, idx: int) -> tuple:
         s           = self.samples[idx]
         frame_items = _sample_clip(s["frames"], self.clip_frames, self.training)
         frames      = []
-        for item in frame_items:
-            img = _load_frame(item["path"])
-            frames.append(_crop_face_or_black(img, item.get("bbox")))
+        fids        = []
+        frame_w     = 1920
+        frame_h     = 1080
+
+        for i, item in enumerate(frame_items):
+            if isinstance(item, dict):
+                p = item.get("path")
+                bbox = item.get("bbox")
+                fid = item.get("fid", i)
+            else:
+                p = item
+                bbox = None
+                fid = i
+            img = _load_frame(p)
+            if i == 0:
+                frame_w, frame_h = img.size
+            frames.append(_crop_face_or_black(img, bbox))
+            fids.append(int(fid))
 
         if self.training:
-            # temporally consistent augmentation
             processed = self.train_transform(frames)
         else:
-            # deterministic val transform
             processed = [self.val_transform(f) for f in frames]
 
         clip = torch.stack(processed, dim=1)   # [C, T, H, W]
-        return clip, s["label"]
+
+        if self.use_track and self.json_path:
+            track = _load_track_features(
+                s["uid"],
+                self.json_path,
+                s["personid"],
+                fids,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                frame_bbox=self._track_frame_maps.get(s["uid"]),
+            )                                  # [T, 6]
+            return clip, track, s["label"]
+        else:
+            return clip, s["label"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -512,6 +661,7 @@ def get_loader(
             img_size       = cfg.img_size,
             min_seg_frames = cfg.min_seg_frames,
             mode           = mode,
+            use_track      = cfg.use_track,
         )
         if distributed and mode == "train":
             from torch.utils.data import DistributedSampler

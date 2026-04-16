@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────
+#  config_small.yaml  –  SMOKE TEST  (freeze all encoder layers)
+#  Goal: verify end-to-end pipeline is clean, loss decreases
+#  ~10 minutes on A5000
+# ─────────────────────────────────────────────────────────────────
+
+project:
+  name: "ttm_audio_smoketest"
+  seed: 42
+  output_dir: "/DATA/G17/outputs/ttm_audio_small"
+  log_dir: "/DATA/G17/outputs/ttm_audio_small/logs"
+  embed_dir: "/DATA/G17/outputs/ttm_audio_small/embeddings"
+
+data:
+  root: "/DATA/G17/Data/wave"
+  annotations_dir: "/DATA/G17/ego4d_data/v2/annotations"
+  train_json: "av_train.json"
+  val_json:   "av_val.json"
+  audio_ext: ".wav"
+  sample_rate: 16000
+  max_audio_sec: 30
+  clip_overlap_sec: 2
+  max_clips_train: 40          # 40 clips → ~440 windows
+  max_clips_val: 20
+
+model:
+  backbone: "openai/whisper-large-v3"
+  freeze_encoder_layers: 32    # ← freeze ALL encoder layers for smoke test
+                               #   only projection head + classifier train
+                               #   eliminates gradient explosion completely
+  projection_dim: 512
+  dropout: 0.1
+  num_classes: 2
+
+training:
+  epochs: 3
+  batch_size: 4                # safe with fully frozen encoder
+  accumulation_steps: 4        # effective batch = 16
+  learning_rate: 1.0e-4        # fine with frozen encoder (only 2M params train)
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  precision: "fp32"            # bf16 works correctly in clean train_audio.py
+  gradient_checkpointing: false  # not needed when encoder is fully frozen
+  dataloader_workers: 2
+  pin_memory: true
+  scheduler: "cosine_with_restarts"
+  num_cycles: 1
+  use_focal_loss: false        # plain CrossEntropyLoss for smoke test
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  save_every_n_epochs: 1
+  keep_last_n_checkpoints: 2
+  early_stopping_patience: 10  # disabled for smoke test
+  monitor_metric: "val_auc"
+
+extraction:
+  batch_size: 8
+  layer: "all"
+  pool_strategy: "none"
+  output_format: "pt"
+  save_per_clip: true
+  fp16_inference: false
