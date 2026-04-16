@@ -215,7 +215,34 @@ new_visual/**/*.pth
 .cursorignore
 .cursorindexingignore
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+
+# Ignore environment files
+.env
+
+# Ignore logs
+*.log
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE-specific files
+.idea/
+.vscode/
+
+# Ignore other unnecessary files
+*.bak
+*.swp
+
+# Ignore data files
+data/
+*.csv
+*.json
+
+# Ignore audio files
+*.wav
+*.mp3
+*.flac
