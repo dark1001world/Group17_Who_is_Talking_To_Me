@@ -15,14 +15,6 @@ Output:
   └── Binary label + probability score per (person, frame) pair
 ```
 
-## Results
- 
-| Model | Accuracy | F1 | mAP ★ | AUC-ROC |
-|---|---|---|---|---|
-| Audio Only (Whisper + SCT) | 0.648 | 0.63 | 0.611 | **0.720** |
-| Visual Only (DINO + Tracks) | 0.627 | 0.53 | 0.595 | 0.636 |
-| **Full Model (Gated Fusion)** ✓ | 0.575 | 0.61 | **0.635** | 0.668 |
-
 ## Installation
  
 ### Prerequisites
@@ -117,7 +109,13 @@ python extract_features.py
 cd Fusion/
 python train_fusion.py
 ```
-
+## Results
+ 
+| Model | Accuracy | F1 | mAP ★ | AUC-ROC |
+|---|---|---|---|---|
+| Audio Only (Whisper + SCT) | 0.648 | 0.63 | 0.611 | **0.720** |
+| Visual Only (DINO + Tracks) | 0.627 | 0.53 | 0.595 | 0.636 |
+| **Full Model (Gated Fusion)** ✓ | 0.575 | 0.61 | **0.635** | 0.668 |
 
 ## References
  
