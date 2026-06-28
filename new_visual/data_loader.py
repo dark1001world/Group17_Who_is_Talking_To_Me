@@ -33,9 +33,9 @@ cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Config
-# ──────────────────────────────────────────────────────────────
+
 
 @dataclass
 class ViTVisualConfig:
@@ -63,9 +63,9 @@ class ViTVisualConfig:
     use_track    : bool  = False
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Normalization constants
-# ──────────────────────────────────────────────────────────────
+
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -77,9 +77,9 @@ _FACE_BBOX_CACHE: dict[tuple[str, str], dict[str, tuple[int, int, int, int]]] = 
 _TRACK_FRAME_CACHE: dict[tuple[str, str], dict[int, dict]] = {}
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Val / Test transform  (deterministic)
-# ──────────────────────────────────────────────────────────────
+
 
 def get_val_transform(img_size: int = 128) -> T.Compose:
     return T.Compose([
@@ -145,9 +145,9 @@ class ConsistentClipTransform:
 
         return processed
 
-# ──────────────────────────────────────────────────────────────
+
 #  Helpers
-# ──────────────────────────────────────────────────────────────
+
 
 def _load_uid_list(path: str) -> list[str]:
     with open(path) as f:
@@ -345,9 +345,9 @@ def _load_track_features(
  
     return torch.tensor(feats, dtype=torch.float32)   # [T, 6]
  
-# ──────────────────────────────────────────────────────────────
+
 #  Sample builder
-# ──────────────────────────────────────────────────────────────
+
 
 def _build_samples(
     uid           : str,
@@ -728,9 +728,9 @@ def _build_context_clips_from_frame_annotations(
     return samples
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Clip sampler
-# ──────────────────────────────────────────────────────────────
+
 
 def _sample_clip(
     paths       : list,
@@ -757,7 +757,7 @@ def _sample_clip(
 
 
 # ──────────────────────────────────────────────────────────────
-#  Train / Val Dataset
+#  Train/Val Dataset
 # ──────────────────────────────────────────────────────────────
 
 class ViTImagerLoader(Dataset):
@@ -883,9 +883,9 @@ class ViTImagerLoader(Dataset):
             return clip, s["label"]
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Test Dataset
-# ──────────────────────────────────────────────────────────────
+
 
 class ViTTestImagerLoader(Dataset):
     def __init__(
@@ -933,17 +933,17 @@ class ViTTestImagerLoader(Dataset):
         return clip, {"uid": s["uid"], "fid2pred": s["fids"]}
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Infer Dataset
-# ──────────────────────────────────────────────────────────────
+
 
 class ViTInferImagerLoader(ViTTestImagerLoader):
     pass
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  MixUp  (batch-level, optional)
-# ──────────────────────────────────────────────────────────────
+
 
 def mixup_batch(
     clips      : Tensor,
@@ -962,9 +962,9 @@ def mixup_batch(
     return mixed, soft
 
 
-# ──────────────────────────────────────────────────────────────
+
 #  Factory
-# ──────────────────────────────────────────────────────────────
+
 
 def get_loader(
     cfg        : ViTVisualConfig,
