@@ -14,6 +14,48 @@ Input:
 Output:
   └── Binary label + probability score per (person, frame) pair
 ```
+---
+
+## System Architecture & Pipeline
+
+```mermaid
+flowchart TD
+    subgraph Audio Branch [Audio Branch: Whisper-base + Semantic Transformer]
+        A1[WAV Audio\n16 kHz mono] --> A2[RMS Norm\nPad/Trim 5s]
+        A2 --> A3[Log-Mel\n80 x 3000]
+        A3 --> A4[Whisper-base\nLayers 1-6\nFrozen]
+        A4 --> A5[Semantic Context\nTransformer\n2L, 8H]
+        A5 --> A6[Semantic Attn.\nPooling]
+        A6 --> A7[Audio Emb.\na ∈ ℝ⁵¹²]
+    end
+
+    subgraph Visual Branch [Visual Branch: DINO + Track Fusion]
+        V1[MP4 Video\n30 FPS] --> V2[Frame Decode\n30 FPS]
+        V2 --> V3[JPEG Frames\n224 x 224]
+        V3 --> V4[DINO ViT-B/16\nFrozen]
+        
+        T1[JSON Tracks\n+ Labels] --> T2[Parse Tracks\n+ Labels]
+        T2 --> T3[Face Crops\nContext Sample]
+        T3 --> T4[Track Features\ng_t ∈ ℝ⁶]
+        T4 --> T5[Track MLP\n6 → 768]
+        
+        V4 --> V6[Gated Track-\nVisual Fusion]
+        T5 --> V6
+        
+        V6 --> V7[Temporal\nTransformer\n2L, 12H]
+        V7 --> V8[Cross-Attn\nTemporal Head\nV ∈ ℝ⁷⁶⁸]
+    end
+
+    subgraph Fusion Stage [Cross-Modal Fusion & Classification]
+        A7 --> F1[Project to\nShared ℝ⁵¹²]
+        V8 --> F1
+        F1 --> F2[Sigmoid Gate\nGated Fusion]
+        F2 --> F3[MLP Classifier\nWeighted BCE]
+        F3 --> F4["ŷ ∈ {0, 1}"]
+    end
+```
+
+---
 
 ## Installation
  
