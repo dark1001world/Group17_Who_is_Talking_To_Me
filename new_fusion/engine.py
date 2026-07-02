@@ -1,14 +1,52 @@
 """
-Visual Pipeline - Engine  (ViT Edition)
-========================================
-Training/validation/inference loops with:
-  - torch.amp mixed precision (bfloat16 on Ampere+, float16 on older)
-  - Exponential Moving Average (EMA) of model weights
-  - Soft-label cross-entropy for MixUp support
-  - mAP via sklearn
-  - Gradient norm clipping + anomaly detection
-"""
+===============================================================================
+Visual Pipeline - Engine (Vision Transformer Edition)
+===============================================================================
 
+This module implements the complete training, validation, and inference
+pipeline for the Vision Transformer (ViT)-based visual model used in the
+multimodal speaker detection framework.
+
+Key Features
+------------
+• End-to-end training, validation, and testing loops.
+• Automatic Mixed Precision (AMP) training using:
+    - bfloat16 on Ampere and newer NVIDIA GPUs.
+    - float16 on older CUDA architectures.
+  This reduces GPU memory consumption and accelerates training.
+
+• Exponential Moving Average (EMA) of model parameters to improve
+  generalization and stabilize evaluation performance.
+
+• Soft-label Cross-Entropy Loss supporting:
+    - MixUp augmentation
+    - Soft target labels
+    - Label interpolation
+
+• Mean Average Precision (mAP) computation using sklearn for
+  multi-label classification performance evaluation.
+
+• Gradient norm clipping to prevent exploding gradients and ensure
+  stable optimization.
+
+• PyTorch anomaly detection for identifying invalid gradients
+  (NaNs/Infs) during backpropagation.
+
+• Modular design allowing easy integration with different datasets,
+  Vision Transformer backbones, and training configurations.
+
+Main Responsibilities
+---------------------
+1. Initialize training components.
+2. Execute forward and backward propagation.
+3. Perform optimizer and scheduler updates.
+4. Maintain EMA model weights.
+5. Compute training and validation metrics.
+6. Save checkpoints and best-performing models.
+7. Run inference on unseen data.
+
+
+"""
 from __future__ import annotations
 
 import copy
