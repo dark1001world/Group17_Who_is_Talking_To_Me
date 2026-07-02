@@ -3,7 +3,7 @@
 
 ## Problem Statement
  
-Given an egocentric video clip (audio + video frames + person-track bounding boxes), predict for each tracked person at each annotated frame a binary label **y ∈ {0, 1}** — does this person direct speech toward the camera wearer?
+Given an egocentric video clip (audio + video frames + person-track bounding boxes), predict for each tracked person at each annotated frame a binary label **y ∈ {0, 1}** — does this person direct speech toward the camera wearer or not ?
  
 ```
 Input:
@@ -17,6 +17,7 @@ Output:
 ---
 
 ## System Architecture & Pipeline
+
 
 ```mermaid
 flowchart TD
@@ -112,6 +113,7 @@ The pipeline uses frame-level extracted annotations:
 ```
  
 **Format of each entry:**
+
 ```json
 {
   "video_uid":  "85775377-b334-4bd7-8cfc-16885099cc9a",
